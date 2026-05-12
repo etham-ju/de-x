@@ -1,0 +1,21 @@
+# Session headers — contain live auth cookies, ct0, bearer token
+request-headers.txt
+request-headers.*.txt
+
+# Twitter archive contents — personal data, never commit
+tweets.js
+like.js
+twitter-*.zip
+twitter-*/
+
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
