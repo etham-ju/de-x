@@ -8,6 +8,7 @@
 ##
 
 import sys
+import os
 import json
 import time
 import random
@@ -37,6 +38,7 @@ def _retweet_extract(d):
 
 TWEETS_MODE = {
     'label': 'delete tweet',
+    'state': 'tweets',
     'url': "https://x.com/i/api/graphql/nxpZCY2K-I6QoFHAHeojFQ/DeleteTweet",
     'query_id': "nxpZCY2K-I6QoFHAHeojFQ",
     'extract': _tweet_extract,
@@ -45,6 +47,7 @@ TWEETS_MODE = {
 
 RETWEETS_MODE = {
     'label': 'delete retweet',
+    'state': 'retweets',
     'url': "https://x.com/i/api/graphql/ZyZigVsNiFO6v1dEks1eWg/DeleteRetweet",
     'query_id': "ZyZigVsNiFO6v1dEks1eWg",
     'extract': _retweet_extract,
@@ -53,6 +56,7 @@ RETWEETS_MODE = {
 
 LIKES_MODE = {
     'label': 'unlike tweet',
+    'state': 'likes',
     'url': "https://x.com/i/api/graphql/ZYKSe-w7KEslx3JhSIk5LA/UnfavoriteTweet",
     'query_id': "ZYKSe-w7KEslx3JhSIk5LA",
     'extract': lambda d: {'tweet_id': d['like']['tweetId']},
@@ -64,6 +68,32 @@ LIKES_MODE = {
 MIN_SLEEP = 3.0
 REST_EVERY = 50
 REST_SECONDS = 30
+
+# Resume support: ids that finished (deleted or already-gone) are recorded
+# here so a re-run skips them. Safe to delete to start over.
+STATE_FILE = 'de-x.state.json'
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding='UTF-8') as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    return {
+        'tweets': set(data.get('tweets', [])),
+        'retweets': set(data.get('retweets', [])),
+        'likes': set(data.get('likes', [])),
+    }
+
+
+def save_state(state):
+    serializable = {k: sorted(v) for k, v in state.items()}
+    tmp = STATE_FILE + '.tmp'
+    with open(tmp, 'w', encoding='UTF-8') as f:
+        json.dump(serializable, f, indent=2)
+    # atomic replace so a crash mid-write can't corrupt the state file
+    os.replace(tmp, STATE_FILE)
 
 
 def get_items(json_data, extract):
@@ -120,34 +150,72 @@ def main(ac, av):
     like_items, _ = load_items(av[2], LIKES_MODE['extract'])
 
     session = parse_req_headers(av[3])
+    state = load_state()
 
     print(f"[i] {len(tweet_items)} tweets to delete, "
           f"{len(retweet_items)} retweets to remove (of those with media only), "
           f"{len(like_items)} likes to remove")
+    print(f"[i] state: already finished tweets={len(state['tweets'])} "
+          f"retweets={len(state['retweets'])} likes={len(state['likes'])}")
 
-    run_batch(session, tweet_items, TWEETS_MODE)
-    run_batch(session, retweet_items, RETWEETS_MODE)
-    run_batch(session, like_items, LIKES_MODE)
+    run_batch(session, tweet_items, TWEETS_MODE, state)
+    run_batch(session, retweet_items, RETWEETS_MODE, state)
+    run_batch(session, like_items, LIKES_MODE, state)
 
 
-def run_batch(session, items, mode):
-    total = len(items)
+def run_batch(session, items, mode, state):
+    bucket = state[mode['state']]
+    key = mode['key']
+    pending = [it for it in items if it[key] not in bucket]
+    skipped_resume = len(items) - len(pending)
+    total = len(pending)
+
+    if skipped_resume:
+        print(f"[i] '{mode['label']}': skipping {skipped_resume} already "
+              f"recorded in {STATE_FILE}")
     if total == 0:
         print(f"[i] nothing to do for '{mode['label']}'")
         return
+
     print(f"[i] starting '{mode['label']}' batch: {total} items")
     started = time.time()
-    for n, item in enumerate(items, 1):
+    stats = {'ok': 0, 'gone': 0, 'error': 0}
+    for n, item in enumerate(pending, 1):
         print(f"[#] {mode['label']} {n}/{total}")
-        delete_tweet(session, item, mode)
+        outcome = delete_tweet(session, item, mode)
+        stats[outcome] = stats.get(outcome, 0) + 1
+        if outcome in ('ok', 'gone'):
+            bucket.add(item[key])
+            save_state(state)
         elapsed = time.time() - started
         rate = n / elapsed if elapsed > 0 else 0
         eta = (total - n) / rate if rate > 0 else 0
         print(f"[i] progress {n}/{total} "
-              f"({rate*60:.1f}/min, ETA {eta/60:.1f}min)")
+              f"(ok={stats['ok']} skipped={stats['gone']} err={stats['error']}, "
+              f"{rate*60:.1f}/min, ETA {eta/60:.1f}min)")
         if n % REST_EVERY == 0 and n != total:
             print(f"[z] scheduled rest: completed {n}, pausing {REST_SECONDS}s")
             time.sleep(REST_SECONDS)
+    print(f"[=] '{mode['label']}' done: ok={stats['ok']} "
+          f"already-gone={stats['gone']} errors={stats['error']}")
+
+
+def _is_already_gone(status, body):
+    """Detect responses that mean 'this tweet/like is already removed'."""
+    if status == 404:
+        # X returns 404 with empty body for already-deleted tweets/retweets
+        return True
+    if status == 200 and body:
+        # GraphQL sometimes returns 200 with an errors array for missing tweets
+        markers = (
+            'No status found',
+            'Tweet not found',
+            'not authorized to view',
+            "doesn't exist",
+        )
+        if any(m in body for m in markers):
+            return True
+    return False
 
 
 def delete_tweet(session, item, mode):
@@ -164,7 +232,7 @@ def delete_tweet(session, item, mode):
     while True:
         r = requests.post(delete_url, data=json.dumps(data), headers=session)
         print(r.status_code, r.reason)
-        print(r.text[:500] + '...')
+        print(r.text[:500] + ('...' if len(r.text) > 500 else ''))
 
         limit = r.headers.get('x-rate-limit-limit', '?')
         remaining_hdr = r.headers.get('x-rate-limit-remaining', '?')
@@ -184,6 +252,15 @@ def delete_tweet(session, item, mode):
             time.sleep(sleep_s)
             backoff = min(backoff * 2, 900)
             continue
+
+        if _is_already_gone(r.status_code, r.text):
+            print(f"[skip] {item[key]} already gone — no action needed")
+            outcome = 'gone'
+        elif r.status_code == 200:
+            outcome = 'ok'
+        else:
+            print(f"[!] unexpected status {r.status_code}, continuing")
+            outcome = 'error'
 
         remaining = int(remaining_hdr) if remaining_hdr.isdigit() else -1
 
@@ -208,7 +285,7 @@ def delete_tweet(session, item, mode):
 
         print(f"[~] sleep {sleep_s:.2f}s ({reason})")
         time.sleep(sleep_s)
-        return
+        return outcome
 
 
 if __name__ == '__main__':

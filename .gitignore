@@ -8,6 +8,10 @@ like.js
 twitter-*.zip
 twitter-*/
 
+# Resume state — contains tweet ids you've already processed
+de-x.state.json
+de-x.state.json.tmp
+
 # macOS / IDE
 .DS_Store
 .idea/
